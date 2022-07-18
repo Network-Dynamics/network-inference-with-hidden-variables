@@ -2,83 +2,15 @@ import numpy as np
 from scipy.integrate import cumtrapz
 from numpy.linalg import pinv, lstsq
 from numba import njit
+from sklearn import metrics as skl_metrics
+from copy import deepcopy
 
 
 def rescale(val, interval=(0, 2*np.pi)):
     """
     rescale val to interval, e.g. (-pi, pi) or (0, 2pi)
     """
-    return (val - interval[0])  % (interval[1] - interval[0]) + interval[0]
-
-
-@njit
-def tpr_fpr(data, pred):
-    """
-    calculate the true positive rate tpr and false positive rate fpr
-    of predicted data pred compared to real data data.
-    Here, every entry in data and in pred is supposed to be either 1 or 0 or boolean
-    """
-    true_positives = 0.
-    false_positives = 0.
-    true_negatives = 0.
-    false_negatives = 0.
-
-    ni, nj = pred.shape
-    for i in range(ni):
-        for j in range(nj):
-            if pred[i, j]:
-                if data[i, j]:
-                    true_positives += 1
-                else:
-                    false_positives += 1
-            else:
-                if data[i, j]:
-                    false_negatives += 1
-                else:
-                    true_negatives += 1
-
-    return true_positives / (true_positives + false_negatives), \
-                false_positives / (true_negatives + false_positives)
-
-
-def roc_auc(data, pred, nthreshold=None):
-    """
-    calculate ROC for predicted data 'pred' and given thresholds.
-    data should be of type np.intXX with entries 0 and 1
-
-    if nthreshold is None, all values in pred larger than 0 are used as
-    thresholds, if nthreshold is Int, linearly spaced thresholds are used
-
-    Returns:
-    --------
-    tpr, fpr, auc, thresholds
-    """
-    if nthreshold is None:
-        thresholds = np.sort(pred.flatten())
-        # include low value for (1, 1) point
-        thresholds = np.hstack((pred.min() - 1, thresholds))
-        n = len(thresholds)
-    elif isinstance(nthreshold, int):
-        thresholds, h = \
-            np.linspace(pred.min(), pred.max(), nthreshold-1,
-                        endpoint=True, retstep=True)
-        # include low value for (1, 1) point
-        thresholds = np.hstack((thresholds[0] - h, thresholds))
-        n = len(thresholds)
-    else:
-        raise ValueError("invalid argument for nthreshold.")
-
-    # reverse order of thresholds
-    thresholds = thresholds[::-1]
-    tpr = np.zeros(n)  # true positive rate
-    fpr = np.zeros(n)  # false positive rate
-
-    for m in range(n):
-        pred_boolean = pred>thresholds[m]  # positives
-        tpr[m], fpr[m] = tpr_fpr(data, pred_boolean)
-
-    auc = np.trapz(tpr, fpr)
-    return tpr, fpr, auc, thresholds
+    return (val - interval[0]) % (interval[1] - interval[0]) + interval[0]
 
 
 @njit
@@ -100,7 +32,7 @@ def _calculate_otsu_threshold_index(p, nbins):
     # index of threshold, correction due to cutoff
     k1 = np.argmax(sigmab_square) + 1
     k2 = len(sigmab_square) - np.argmax(sigmab_square[::-1])
-    k = (k1+k2)//2
+    k = (k1+k2)//2  # use bin which is centered on plateau
     # k = np.argmax(sigmab_square) + 1 # just use first bin
     return k
 
@@ -139,7 +71,7 @@ def mean_abs_err_angles(phi1, phi2):
     """
     calculate mean absolute error of two angles
     """
-    d = np.abs(phi1 - phi2)
+    d = np.array(np.abs(rescale(phi1, interval=(0, 2*np.pi)) - rescale(phi2, interval=(0, 2*np.pi))))
     idx = d>np.pi
     d[idx] = 2*np.pi - d[idx]
     return np.mean(d)
@@ -358,17 +290,20 @@ class Reconstructor():
                 for i in range(self.N) for j in range(self.N)]
             ).reshape(self.N, self.N)
         else:
-            Kvals = [np.sqrt((self.C_opt[i, j])**2 + (self.C_opt[i, j+self.N])**2)
-                    for i in range(self.N) for j in range(i)]
+            Kvals = [
+                0.5 * np.sqrt((self.C_opt[i, j] + self.C_opt[j, i])**2 + 
+                (self.C_opt[i, j+self.N] - self.C_opt[j, i+self.N])**2)
+                for i in range(self.N) for j in range(i)
+            ]
             # values of lower triangle, values on diagonal are equal to zero
-            K = np.zeros((self.N,self.N))
+            K = np.zeros((self.N, self.N))
             upper_ids = np.triu_indices(self.N)     # upper right indices of triangular matrix
             lower_ids = np.tril_indices(self.N, -1) # lower left indices of triangular matrix
             K[lower_ids] = Kvals
             K[upper_ids] = K.T[upper_ids]
         return K
 
-    def reconstruct(self, M=None, s=1, method='lstsq'):
+    def reconstruct(self, M=None, method='lstsq'):
         """
         reconstruct the network topology and phase differences, using M measurement steps
 
@@ -388,9 +323,11 @@ class Reconstructor():
 
         Sets:
         -----
-        self.K_raw: the raw reconstructed matrix\n
-        self.K: the refined reconstructed matrix\n
-        self.deltax_rec: the reconstructed phase differences for each reconstructed edge
+        self.K_raw: the raw reconstructed matrix  
+        self.K: the refined reconstructed matrix  
+        self.deltax_rec: the reconstructed phase differences for each reconstructed edge  
+        self.method: the method used to solve the overdetermined linear system of equations
+
         """
         self.method = method
         if M is None:  # use all data points for reconstruction
@@ -398,13 +335,12 @@ class Reconstructor():
         self.calculate_Copt(M)
 
         self.K_rec = self.reconstruct_matrix()
-        self.K_raw = np.copy(self.K_rec) * self.dydt_fac
-        self.K = np.copy(self.K_raw)
+        self.K_raw = self.K_rec * self.dydt_fac
+        self.K = deepcopy(self.K_raw)
 
         self.threshold = self.threshold_func(self.K.ravel())
         self.K[self.K < self.threshold] = 0
 
-        # self.deltax_rec = self.reconstruct_delta_x(np.mean(self.deltax[:, :, M-s:M], axis=2))  # self.deltax_rec[j][i] = delta_x_ji            
         self.deltax_rec = self.reconstruct_delta_x(self.deltax[:, :, :M])  # self.deltax_rec[j][i] = delta_x_ji            
 
     def get_results(self):
@@ -422,60 +358,126 @@ class Reconstructor():
         """
         return self.K, self.deltax_rec
 
-    def compare_matrix(self, A, AUC=True, ERR=True, errfunction=None):
+    def metrics(self, A:np.ndarray=None, x:np.ndarray=None, s:int=100)->dict:
         """
-        Compares the reconstrucetes matrix with a given matrix A
+        Compute metrics of reconstruction.
 
         Parameters:
         -----------
-        A: np.ndarray, shape (N,N)
-            the reference matrix
-        AUC: bool, optional
-            whether the AUC score should be calculated and returned
-        ERR: bool, optional
-            whether an Error score should be calculated.
-            If errfunction is not specified, ERR defaults to the Mean Absolute Error
-        errfunction: callable, optional
-            used error measure , defaults to Mean Absolute Error
-        
-        Returns:
-        --------
-        dictionary
+        A: np.ndarray, shape (N, N)  
+            Real network, N denotes the number of nodes.   
+            If given, Mean Absolute Error, Area under the Receiver-Operator-Characteristics Curve and  
+            Average Precicion (Area under Precision-Recall Curve) are calculated.  
+        x: np.ndarray, shape (N, M)  
+            Real time series of hidden variable x for each node.  
+            N denotes the number of nodes, M denotes the number of measurements.
+            If given, mean absolute error is calculated, assuming x are phase angles.
+        s: int, default s=100
+            Assuming absolute convergence of x, s denotes the number of trailing measurements of x
+            that are averaged.
         """
-        d = {}
-        if ERR or callable(errfunction):  # calculate error
-            if not callable(errfunction):
-                errfunction = mean_abs_err_thresholded_data
-            err = errfunction(A, self.K)
-            d["ERR"] = err
-        if AUC:  # calculate AUC score
-            tpr, fpr, auc, _ = roc_auc(A > 0, self.K_raw)
-            d['AUC'] = auc
-        return d
+        m = dict()
+        if A is not None:
+            m['mae'] = mean_abs_err_thresholded_data(A, self.K)
+            m['auc'] = skl_metrics.roc_auc_score((A > 0).ravel(), self.K_raw.ravel())
+            m['ap']  = skl_metrics.average_precision_score((A > 0).ravel(), self.K_raw.ravel())
+            m['F1-score'] = skl_metrics.f1_score((A > 0).ravel(), (self.K > 0).ravel())
+        if x is not None:
+            tmp = np.array([
+                [np.mean(x[j, -s:] - x[i, -s:]), dx_rec[-1]] 
+                for (j, i), dx_rec in self.deltax_rec])
+            # dxreal, dxrec = tmp[:, 0], tmp[:, 1]
+            m['mae x'] = mean_abs_err_angles(tmp[:, 0], tmp[:, 1])
+        return m
 
-    def compare_deltax(self, x, s=100, errfunction=None):
+
+
+class DirectMethod():
+    """ 
+    implementation of the 'direct method' to infer network topology from a measured time series,
+    adjusted to dynamical systems of the functional form:
+
+    `dot(yi) = g(t, x, y, *args) + sum_j Kij sin(xi - xj)`
+
+    See 
+    Timme, Marc, and Jose Casadiego. “Revealing Networks from Dynamics: An Introduction.” Journal of Physics A: Mathematical and Theoretical 47, no. 34 (August 29, 2014): 343001. https://doi.org/10.1088/1751-8113/47/34/343001.
+    """
+    def __init__(self, t, x, y, *args, g, gkwargs, fac=1, threshold_kwargs={'bins':128}) -> None:
+        assert x.shape == y.shape, 'x.shape unequal to y.shape'
+        self.N, self.M = x.shape
+        self.t = t
+        self.x, self.y = x, y
+        self.threshold_kwargs = threshold_kwargs
+
+        self.R = np.sin(np.array(
+            [self.x[j] - self.x[i] 
+            for i in range(self.N) 
+            for j in range(self.N)]
+        ).reshape(self.N, self.N, self.M))
+
+        self.g_eval = g(t, x, y, *args, **gkwargs)
+
+        if isinstance(fac, np.ndarray) and fac.shape==(self.N,):
+            self.fac = fac[:, np.newaxis]
+        else:
+            self.fac = fac
+    
+    def calculate_L(self, M=None):
+        """ shape: (N, M) """
+        if M is None:
+            M = self.M
+        dot_y = np.gradient(self.y[:, :M], self.t[:M], axis=1)
+        self.L = dot_y - self.g_eval[:, :M]
+    
+    def reconstruct(self, M=None):
+        """ shape: (N, N) """
+        if not hasattr(self, 'L') or \
+            (M is not None and self.L.shape[1] != M) or \
+                (self.L.shape[1] != self.M):
+            self.calculate_L(M)
+
+        if M and M < self.M:  # use only M data points
+            R = self.R[:, :, :M]
+        else:  # use all data points
+            R = self.R
+
+        self.K_rec = np.array([lstsq(R[i].T, self.L[i].T, rcond=None)[0].T for i in range(self.N)])
+        self.K_raw = self.K_rec * self.fac
+        self.K = deepcopy(self.K_raw)
+
+        self.threshold = otsu_threshold(self.K.ravel(), **self.threshold_kwargs)
+        self.K[self.K < self.threshold] = 0
+
+    def get_results(self):
         """
-        Compares reconstructed delta x in fixed point with deltas from a given x
-        
+        returns the reconstructed matrix
+
         Parameters:
         -----------
-        x: np.array, shape (N, M)
-            time series of x at each node
-        s: int, optional
-            the difference between the nodal x values is averaged over the last s values
-            to obtain a more accurate value in the fixed point
-        errfunction: callable, optional
-            used error measure, defaults to Mean Absolute Error for angles
-        
+        None
+
         Returns:
         --------
-        delta x real (np.ndarray), delta x reconstructed (np.ndarray), error measure (float)
+        reconstructed matrix (np.ndarray, shape (N, N)),\n
         """
-        if  errfunction is None:
-            errfunction = mean_abs_err_angles
+        return self.K
 
-        tmp = np.array(
-            [[np.mean(x[j, -s:] - x[i, -s:]), np.mean(dx_rec[-s:])] for (j, i), dx_rec in self.deltax_rec])
-        dxreal, dxrec = tmp[:, 0], tmp[:, 1]
+    def metrics(self, A:np.ndarray=None)->dict:
+        """
+        Compute metrics of reconstruction.
 
-        return dxreal, dxrec, errfunction(dxreal, dxrec)
+        Parameters:
+        -----------
+        A: np.ndarray, shape (N, N)  
+            Real network, N denotes the number of nodes.   
+            If given, Mean Absolute Error, Area under the Receiver-Operator-Characteristics Curve and  
+            Average Precicion (Area under Precision-Recall Curve) are calculated.  
+        """
+        m = dict()
+        if A is not None:
+            m['mae'] = mean_abs_err_thresholded_data(A, self.K)
+            m['auc'] = skl_metrics.roc_auc_score((A > 0).ravel(), self.K_raw.ravel())
+            m['ap']  = skl_metrics.average_precision_score((A > 0).ravel(), self.K_raw.ravel())
+            m['F1-score'] = skl_metrics.f1_score((A > 0).ravel(), (self.K > 0).ravel())
+        return m
+
