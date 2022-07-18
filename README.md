@@ -4,7 +4,7 @@ Code to  reconstruct the network topology in dynamical systems with following th
 
 $\dfrac{dx_i}{dt} = f(\mathbf{y}, t)$  
   
-$\dfrac{dy_i}{dt} = g(\mathbf{y}, t) + \sum_{j=1}^n \sin{\left(x_j(t) - x_i(t)\right)}$
+$\dfrac{dy_i}{dt} = g(\mathbf{y}, t) + \sum_{j=1}^{n} \sin{\left(x_j(t) - x_i(t)\right)}$
 
 assuming $f,g$ and $y_i$ are known for all $i=0,\ldots N$.  
 
